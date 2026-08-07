@@ -37,7 +37,8 @@ type Window struct {
 // whether the buffered bytes still describe the same file.
 func (w *Window) Reset(r io.ReaderAt, buf []byte) {
 	w.err = nil
-	if buf != nil && (len(buf) != len(w.buf) || unsafe.SliceData(buf) != unsafe.SliceData(w.buf)) {
+	if buf != nil &&
+		(len(buf) != len(w.buf) || unsafe.SliceData(buf) != unsafe.SliceData(w.buf)) {
 		// A different buffer: base and n describe the old one's contents.
 		// Handing back the same slice must stay a no-op — callers pass it on
 		// every Reset, and dropping the bytes each time would defeat the point.
@@ -103,4 +104,56 @@ func (w *Window) fillByteAt(off int64) (byte, bool) {
 		return 0, false
 	}
 	return w.buf[0], true
+}
+
+type window struct {
+	base int64
+	buf  []byte
+	r    io.ReaderAt
+	err  error
+}
+
+func (w *window) reset(r io.ReaderAt, buf []byte) {
+	w.err = nil
+	buf = buf[:len(buf):len(buf)] // Trim capacity to length since w.buf capacity encodes usable space.
+	if buf != nil &&
+		(cap(buf) != cap(w.buf) || unsafe.SliceData(buf) != unsafe.SliceData(w.buf)) {
+		// A different buffer: base and n describe the old one's contents.
+		// Handing back the same slice must stay a no-op — callers pass it on
+		// every Reset, and dropping the bytes each time would defeat the point.
+		w.buf = buf[:0]
+	} else if w.r == r {
+		// Same buffer and ReaderAt: buffered bytes and base still valid.
+		// Optimistic return here to potentially prevent a read.
+		return
+	}
+	w.r = r
+	w.buf = buf[:0]
+}
+
+func (w *window) fill(off int64) bool {
+	if w.r == nil || cap(w.buf) == 0 {
+		w.err = lexorg.ErrUninitialized
+		return false
+	}
+	n, err := w.r.ReadAt(w.buf[:cap(w.buf)], off)
+	w.err = err
+	w.buf = w.buf[:n]
+	w.base = off
+	return n > 0
+}
+
+func (w *window) eof() bool {
+	return w.err == io.EOF
+}
+
+func (w *window) byteAt(off int64) (byte, bool) {
+	if i := off - w.base; i >= 0 && i < int64(len(w.buf)) {
+		return w.buf[i], true
+	} else if off >= w.base && w.err != nil {
+		return 0, false
+	} else if w.fill(off) {
+		return w.buf[0], true
+	}
+	return 0, false
 }
