@@ -19,11 +19,23 @@ import "io"
 // The zero StreamReaderAt is unusable; [StreamReaderAt.Reset] supplies the
 // reader and the buffer.
 type StreamReaderAt struct {
-	r    io.Reader
-	bufs [2][]byte // Retained bytes; length is what the fill wrote.
-	base [2]int64  // Stream offset of bufs[i][0]. The two spans abut.
-	cur  uint8     // Buffer the last fill wrote; the other holds the older span.
-	err  error     // Sticky: unlike a file, a stream cannot be retried.
+	r io.Reader
+	// Yield is called when the reader hands back no bytes and no error, which
+	// io.Reader discourages without forbidding. consecutiveYields counts such
+	// reads in a row and starts at 1, resetting as soon as bytes arrive, so it
+	// is what a backoff or an attempt limit keys off. Returning false gives up
+	// on the stream and fails the fill with io.ErrNoProgress.
+	//
+	// It is where waiting policy lives: runtime.Gosched to let a producer run,
+	// a sleep to stop spinning, a deadline check to bail out. A nil Yield gives
+	// up on the first such read, rather than have this package pick a spin
+	// count on the caller's behalf. Reset keeps it, since it configures s
+	// rather than describing the stream bound to it.
+	Yield func(consecutiveYields uint) bool
+	bufs  [2][]byte // Retained bytes; length is what the fill wrote.
+	base  [2]int64  // Stream offset of bufs[i][0]. The two spans abut.
+	cur   uint8     // Buffer the last fill wrote; the other holds the older span.
+	err   error     // Sticky: unlike a file, a stream cannot be retried.
 }
 
 // Reset binds s to r, reading through buf split into the two halves it fills
@@ -80,10 +92,6 @@ func (s *StreamReaderAt) ReadAt(b []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// maxEmptyReads bounds how many times a fill tolerates a reader that hands
-// back no bytes and no error before it calls the stream stuck.
-const maxEmptyReads = 100
-
 // fill reads the next span into the older buffer and makes it the newer one,
 // so what the last fill left resident becomes the older span.
 func (s *StreamReaderAt) fill() bool {
@@ -93,7 +101,11 @@ func (s *StreamReaderAt) fill() bool {
 	// up short only at the end of the stream: a partial fill would shrink the
 	// retained range for no reason and flip the buffers sooner than needed.
 	b := s.bufs[next][:cap(s.bufs[next])]
-	n, empty, err := 0, 0, error(nil)
+	var (
+		n     int
+		empty uint
+		err   error
+	)
 	for n < len(b) {
 		nn, rerr := s.r.Read(b[n:])
 		n, err = n+nn, rerr
@@ -103,10 +115,9 @@ func (s *StreamReaderAt) fill() bool {
 			empty = 0
 			continue
 		}
-		// A reader returning no bytes and no error is discouraged rather than
-		// forbidden, so give up on one instead of spinning. bufio makes the
-		// same allowance for the same reason.
-		if empty++; empty >= maxEmptyReads {
+		// The read made no progress and did not fail, so wait however Yield
+		// says to and stop when it stops asking for more.
+		if empty++; s.Yield == nil || !s.Yield(empty) {
 			err = io.ErrNoProgress
 			break
 		}

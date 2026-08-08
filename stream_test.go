@@ -246,7 +246,8 @@ func (i *idle) Read(b []byte) (int, error) {
 }
 
 func TestStreamReaderAtNoProgress(t *testing.T) {
-	// A reader that never returns anything must not spin the fill loop.
+	// With no Yield to say how long to wait, a read that makes no progress
+	// fails at once rather than spin on a count this package chose.
 	stuck := &idle{}
 	var s lexorg.StreamReaderAt
 	s.Reset(stuck, make([]byte, 16))
@@ -255,8 +256,8 @@ func TestStreamReaderAtNoProgress(t *testing.T) {
 	if !errors.Is(err, io.ErrNoProgress) || n != 0 {
 		t.Fatalf("ReadAt on a stuck reader=%d %v, want 0 %v", n, err, io.ErrNoProgress)
 	}
-	if stuck.reads > 200 {
-		t.Errorf("a stuck reader was polled %d times before giving up", stuck.reads)
+	if stuck.reads != 1 {
+		t.Errorf("a stuck reader was polled %d times, want 1", stuck.reads)
 	}
 	// Giving up latches, so a second call does not poll it again either.
 	reads := stuck.reads
@@ -269,9 +270,19 @@ func TestStreamReaderAtNoProgress(t *testing.T) {
 }
 
 func TestStreamReaderAtEmptyReadsRecover(t *testing.T) {
-	// Empty reads short of the limit are just slowness, not a stuck stream.
+	// A reader that stalls between real reads gets through only because Yield
+	// keeps asking for it. Without one the same stream fails on the first stall.
 	slow := &idle{r: strings.NewReader(streamData), empty: 3}
+	var bare lexorg.StreamReaderAt
+	bare.Reset(slow, make([]byte, 16))
+	// Far enough to outrun the one fill that lands before the first stall.
+	if n, err := bare.ReadAt(make([]byte, len(streamData)), 0); !errors.Is(err, io.ErrNoProgress) {
+		t.Fatalf("stalling reader with no Yield=%d %v, want %v", n, err, io.ErrNoProgress)
+	}
+
+	slow = &idle{r: strings.NewReader(streamData), empty: 3}
 	var s lexorg.StreamReaderAt
+	s.Yield = func(uint) bool { return true }
 	s.Reset(slow, make([]byte, 16))
 
 	b := make([]byte, len(streamData))
@@ -281,6 +292,86 @@ func TestStreamReaderAtEmptyReadsRecover(t *testing.T) {
 	}
 	if string(b) != streamData {
 		t.Errorf("ReadAt over a slow reader=%q, want %q", b, streamData)
+	}
+}
+
+func TestStreamReaderAtYield(t *testing.T) {
+	// Yield sees the run length, starting at 1 and restarting once bytes come
+	// through, so a backoff keyed off it never carries across progress.
+	slow := &idle{r: strings.NewReader(streamData), empty: 3}
+	var s lexorg.StreamReaderAt
+	var seen []uint
+	s.Yield = func(consecutiveYields uint) bool {
+		seen = append(seen, consecutiveYields)
+		return true
+	}
+	s.Reset(slow, make([]byte, 16))
+
+	b := make([]byte, len(streamData))
+	if n, err := s.ReadAt(b, 0); n != len(streamData) || err != nil {
+		t.Fatalf("ReadAt over a slow reader=%d %v, want %d nil", n, err, len(streamData))
+	}
+	if string(b) != streamData {
+		t.Fatalf("ReadAt over a slow reader=%q, want %q", b, streamData)
+	}
+	if len(seen) == 0 {
+		t.Fatal("Yield was never called over a reader that stalls")
+	}
+	for i, got := range seen {
+		if want := uint(i%3 + 1); got != want {
+			t.Fatalf("Yield call %d saw %d consecutive, want %d (run %v)", i, got, want, seen)
+		}
+	}
+}
+
+func TestStreamReaderAtYieldHalts(t *testing.T) {
+	// Returning false gives up on the stream, however early.
+	const giveUpAfter = 3
+	stuck := &idle{}
+	var s lexorg.StreamReaderAt
+	calls := uint(0)
+	s.Yield = func(consecutiveYields uint) bool {
+		calls = consecutiveYields
+		return consecutiveYields < giveUpAfter
+	}
+	s.Reset(stuck, make([]byte, 16))
+
+	if n, err := s.ReadAt(make([]byte, 4), 0); !errors.Is(err, io.ErrNoProgress) || n != 0 {
+		t.Fatalf("ReadAt when Yield halts=%d %v, want 0 %v", n, err, io.ErrNoProgress)
+	}
+	if calls != giveUpAfter {
+		t.Errorf("Yield stopped at %d, want %d", calls, giveUpAfter)
+	}
+	if stuck.reads != giveUpAfter {
+		t.Errorf("a halting Yield let the reader be polled %d times, want %d",
+			stuck.reads, giveUpAfter)
+	}
+
+	// Halting latches like any other failure.
+	reads := stuck.reads
+	if _, err := s.ReadAt(make([]byte, 4), 0); !errors.Is(err, io.ErrNoProgress) {
+		t.Errorf("second ReadAt err=%v, want the latched %v", err, io.ErrNoProgress)
+	}
+	if stuck.reads != reads {
+		t.Errorf("a latched failure polled the reader %d more times", stuck.reads-reads)
+	}
+}
+
+func TestStreamReaderAtYieldSurvivesReset(t *testing.T) {
+	// Yield configures s, so rebinding the stream must not clear it.
+	var s lexorg.StreamReaderAt
+	calls := 0
+	s.Yield = func(uint) bool { calls++; return false }
+	s.Reset(&idle{}, make([]byte, 16))
+	if _, err := s.ReadAt(make([]byte, 4), 0); !errors.Is(err, io.ErrNoProgress) {
+		t.Fatalf("ReadAt err=%v, want %v", err, io.ErrNoProgress)
+	}
+	s.Reset(&idle{}, nil)
+	if _, err := s.ReadAt(make([]byte, 4), 0); !errors.Is(err, io.ErrNoProgress) {
+		t.Errorf("ReadAt after Reset err=%v, want %v", err, io.ErrNoProgress)
+	}
+	if calls != 2 {
+		t.Errorf("Yield ran %d times across the Reset, want 2", calls)
 	}
 }
 
