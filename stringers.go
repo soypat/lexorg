@@ -9,11 +9,12 @@ func _() {
 	// Re-run the stringer command to generate them again.
 	var x [1]struct{}
 	_ = x[ErrUninitialized-1]
+	_ = x[ErrRewound-2]
 }
 
-const _errGeneric_name = "lexorg: need initialization"
+const _errGeneric_name = "lexorg: need initializationlexorg: offset precedes retained stream bytes"
 
-var _errGeneric_index = [...]uint8{0, 27}
+var _errGeneric_index = [...]uint8{0, 27, 72}
 
 func (i errGeneric) String() string {
 	i -= 1
