@@ -157,6 +157,39 @@ func TestWindowEOF(t *testing.T) {
 	}
 }
 
+// TestWindowFillEmptyKeepsBytes covers the fill that comes back with nothing:
+// no bytes were read, so the resident ones still describe the file and must
+// survive. Reset clears the recorded EOF, which is what lets such a fill be
+// attempted at all.
+func TestWindowFillEmptyKeepsBytes(t *testing.T) {
+	const data = "abc"
+	c := newCounter(data)
+	var w lexorg.Window
+	w.Reset(c, make([]byte, 2*len(data)))
+
+	byteAt(t, &w, 0, data[0])
+	want, wantBase := w.Buffer()
+	if len(want) != len(data) || wantBase != 0 {
+		t.Fatalf("setup left %d bytes @%d, want %d @0", len(want), wantBase, len(data))
+	}
+
+	// Same reader, so the bytes stay; the recorded EOF does not.
+	w.Reset(c, nil)
+	if _, ok := w.Fill(int64(len(data))); ok {
+		t.Fatal("Fill past the end of the file reported bytes")
+	}
+	got, base := w.Buffer()
+	if base != wantBase || string(got) != string(want) {
+		t.Errorf("empty fill left %q @%d, want %q @%d", got, base, want, wantBase)
+	}
+	// The bytes are not merely present, they are still reachable without a read.
+	reads := c.reads
+	byteAt(t, &w, int64(len(data))-1, data[len(data)-1])
+	if c.reads != reads {
+		t.Errorf("reading a kept byte cost %d reads, want 0", c.reads-reads)
+	}
+}
+
 func TestWindowErr(t *testing.T) {
 	errRead := errors.New("read failed")
 	c := newCounter("0123456789abcdef")
@@ -528,20 +561,24 @@ func TestWindowReaderReadRune(t *testing.T) {
 func TestWindowReaderResetReuse(t *testing.T) {
 	const data = "0123456789abcdef"
 	c := newCounter(data)
-	buf := make([]byte, 8)
+	buf := make([]byte, len(data)/2)
 	var wr lexorg.WindowReader
-	wr.Reset(c, buf, 4)
+	// A window starting inside the file, so an offset can fall on either side.
+	start := int64(len(buf)) / 2
+	wr.Reset(c, buf, start)
 
-	if b, err := wr.ReadByte(); err != nil || b != '4' {
-		t.Fatalf("ReadByte at 4 = %q %v", b, err)
+	if b, err := wr.ReadByte(); err != nil || b != data[start] {
+		t.Fatalf("ReadByte at %d = %q %v, want %q", start, b, err, data[start])
 	}
 	if c.reads != 1 {
 		t.Fatalf("setup cost %d reads, want 1", c.reads)
 	}
+	resident, base := wr.Buffer()
+	end := base + int64(len(resident))
 
-	// The window holds [4,12). Reset to the same reader and buffer at an offset
-	// inside it moves the cursor and nothing else.
-	for _, off := range []int64{4, 7, 11} {
+	// Reset to the same reader and buffer at an offset inside the resident
+	// bytes moves the cursor and nothing else.
+	for _, off := range []int64{base, (base + end) / 2, end - 1} {
 		wr.Reset(c, buf, off)
 		if wr.Offset() != off {
 			t.Errorf("Reset to %d left Offset()=%d", off, wr.Offset())
@@ -554,29 +591,41 @@ func TestWindowReaderResetReuse(t *testing.T) {
 		t.Errorf("resetting inside the window cost %d reads, want 0", c.reads-1)
 	}
 
-	// An offset outside the resident bytes still costs no read at Reset time,
-	// and the fill buffer survives: only the first read pays.
-	wr.Reset(c, buf, 12)
-	if wr.Offset() != 12 {
-		t.Errorf("Reset outside the window left Offset()=%d, want 12", wr.Offset())
+	// The offset just past the resident bytes is where a forward scan stops, so
+	// it keeps them: the cursor sits at the edge rather than outside.
+	wr.Reset(c, buf, end)
+	if wr.Offset() != end {
+		t.Errorf("Reset to the window's edge left Offset()=%d, want %d", wr.Offset(), end)
+	}
+	if got, gotBase := wr.Buffer(); gotBase != base || len(got) != len(resident) {
+		t.Errorf("Reset to the window's edge dropped the bytes: %d@%d, want %d@%d",
+			len(got), gotBase, len(resident), base)
+	}
+
+	// An offset past that still costs no read at Reset time, and the fill
+	// buffer survives: only the first read pays.
+	wr.Reset(c, buf, end+1)
+	if wr.Offset() != end+1 {
+		t.Errorf("Reset outside the window left Offset()=%d, want %d", wr.Offset(), end+1)
 	}
 	if c.reads != 1 {
 		t.Errorf("Reset outside the window cost %d reads, want 0", c.reads-1)
 	}
-	if b, err := wr.ReadByte(); err != nil || b != 'c' {
-		t.Errorf("ReadByte after reset outside=%q %v, want 'c'", b, err)
+	if b, err := wr.ReadByte(); err != nil || b != data[end+1] {
+		t.Errorf("ReadByte after reset outside=%q %v, want %q", b, err, data[end+1])
 	}
 	if c.reads != 2 {
 		t.Errorf("first read after reset cost %d reads, want 1", c.reads-1)
 	}
 
 	// A different reader drops the bytes but keeps the buffer.
-	wr.Reset(newCounter("FEDCBA9876543210"), nil, 3)
-	if wr.Offset() != 3 {
-		t.Errorf("Reset to another reader left Offset()=%d, want 3", wr.Offset())
+	const other = "FEDCBA9876543210"
+	wr.Reset(newCounter(other), nil, start)
+	if wr.Offset() != start {
+		t.Errorf("Reset to another reader left Offset()=%d, want %d", wr.Offset(), start)
 	}
-	if b, err := wr.ReadByte(); err != nil || b != 'C' {
-		t.Errorf("ReadByte on the new reader=%q %v, want 'C'", b, err)
+	if b, err := wr.ReadByte(); err != nil || b != other[start] {
+		t.Errorf("ReadByte on the new reader=%q %v, want %q", b, err, other[start])
 	}
 }
 
@@ -640,6 +689,36 @@ func TestWindowReaderMixed(t *testing.T) {
 	}
 	if wr.Offset() != int64(len(data)) {
 		t.Errorf("Offset()=%d at end, want %d", wr.Offset(), len(data))
+	}
+}
+
+func TestWindowReaderBuffer(t *testing.T) {
+	// The resident bytes are what a caller aliases to hand back a span it has
+	// already read, so the cursor's window must be visible through the reader.
+	const data = "0123456789abcdef"
+	var wr lexorg.WindowReader
+	wr.Reset(newCounter(data), make([]byte, 6), 4)
+
+	// Reset parks base at the requested offset over an empty window.
+	if buf, base := wr.Buffer(); len(buf) != 0 || base != 4 {
+		t.Errorf("Buffer() before any read=%q @%d, want empty @4", buf, base)
+	}
+	for range 3 {
+		if _, err := wr.ReadByte(); err != nil {
+			t.Fatalf("ReadByte err=%v", err)
+		}
+	}
+	buf, base := wr.Buffer()
+	if base != 4 {
+		t.Fatalf("Buffer() base=%d, want 4", base)
+	}
+	if string(buf) != data[base:base+int64(len(buf))] {
+		t.Errorf("Buffer()=%q, want %q", buf, data[base:base+int64(len(buf))])
+	}
+	// The cursor stands inside what it reports, which is what makes an alias of
+	// a span already passed valid.
+	if off := wr.Offset(); off < base || off > base+int64(len(buf)) {
+		t.Errorf("Offset()=%d outside resident [%d,%d)", off, base, base+int64(len(buf)))
 	}
 }
 

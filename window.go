@@ -99,6 +99,10 @@ func (w *Window) Fill(off int64) (byte, bool) {
 	}
 	n, err := w.r.ReadAt(w.buf[:cap(w.buf)], off)
 	w.err = err
+	if n == 0 && off <= w.base+int64(len(w.buf)) {
+		// If fill finds nothing then keeping window costs nothing, keep it and store error if any.
+		return 0, false
+	}
 	w.base, w.buf = off, w.buf[:n]
 	if n == 0 {
 		return 0, false
@@ -235,7 +239,9 @@ func (wr *WindowReader) Fill(off int64) (byte, bool) {
 // them costs no read at all — only the cursor moves.
 func (wr *WindowReader) Reset(r io.ReaderAt, buf []byte, offset int64) {
 	wr.w.Reset(r, buf)
-	if i := offset - wr.w.base; i >= 0 && i < int64(len(wr.w.buf)) {
+	if i := offset - wr.w.base; i >= 0 && i <= int64(len(wr.w.buf)) {
+		// Check above uses <= since if it lands at edge of existing buffer
+		// the user may still want to read previous data.
 		wr.bufoff = int(i) // offset is resident: reaching it needs no read.
 		return
 	}
@@ -253,6 +259,9 @@ func (wr *WindowReader) Drop() {
 	wr.w.base, wr.bufoff = wr.Offset(), 0
 	wr.w.Drop()
 }
+
+// Buffer returns the resident bytes and the file offset of first byte buf[0].
+func (wr *WindowReader) Buffer() ([]byte, int64) { return wr.w.Buffer() }
 
 // ReaderAt returns the underlying ReaderAt.
 func (wr *WindowReader) ReaderAt() io.ReaderAt {
