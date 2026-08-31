@@ -110,6 +110,26 @@ func (w *Window) Fill(off int64) (byte, bool) {
 	return w.buf[0], true
 }
 
+// View returns the n bytes at off as a subslice of the resident bytes, refilling
+// only when the span is not already held whole. n may not exceed the fill size.
+func (w *Window) View(off int64, n int) ([]byte, error) {
+	if i := off - w.base; i >= 0 && n >= 0 && i+int64(n) <= int64(len(w.buf)) {
+		return w.buf[i : i+int64(n) : i+int64(n)], nil
+	} else if n < 0 || n > cap(w.buf) {
+		return nil, ErrViewTooLarge
+	}
+	if _, ok := w.Fill(off); !ok {
+		if w.err != nil {
+			return nil, w.err
+		}
+		return nil, io.ErrUnexpectedEOF
+	}
+	if len(w.buf) < n {
+		return w.buf[:len(w.buf):len(w.buf)], io.ErrUnexpectedEOF
+	}
+	return w.buf[:n:n], nil
+}
+
 // ReadAt copies the part of b the resident window already holds and reads the
 // rest straight through to the underlying reader, honouring the io.ReaderAt
 // contract: a short read always comes with a non-nil error. It leaves the
@@ -266,4 +286,18 @@ func (wr *WindowReader) Buffer() ([]byte, int64) { return wr.w.Buffer() }
 // ReaderAt returns the underlying ReaderAt.
 func (wr *WindowReader) ReaderAt() io.ReaderAt {
 	return wr.w.ReaderAt()
+}
+
+// ReadView returns the next n bytes as a subslice of the resident bytes and advances
+// the cursor past them. Can only read window-sized amount of bytes. See [Window.View].
+func (wr *WindowReader) ReadView(n int) ([]byte, error) {
+	off := wr.Offset()
+	b, err := wr.w.View(off, n)
+	if err != nil {
+		return b, err
+	}
+	// View may have refilled and rebased the window, so recompute the cursor
+	// from the absolute offset rather than trusting the old bufoff.
+	wr.bufoff = int(off-wr.w.base) + len(b)
+	return b, nil
 }

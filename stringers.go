@@ -10,11 +10,12 @@ func _() {
 	var x [1]struct{}
 	_ = x[ErrUninitialized-1]
 	_ = x[ErrRewound-2]
+	_ = x[ErrViewTooLarge-3]
 }
 
-const _errGeneric_name = "lexorg: need initializationlexorg: offset precedes retained stream bytes"
+const _errGeneric_name = "lexorg: need initializationlexorg: offset precedes retained stream byteslexorg: view longer than fill buffer"
 
-var _errGeneric_index = [...]uint8{0, 27, 72}
+var _errGeneric_index = [...]uint8{0, 27, 72, 108}
 
 func (i errGeneric) String() string {
 	i -= 1

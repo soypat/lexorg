@@ -7,6 +7,7 @@ const (
 	_                errGeneric = iota // lexorg: undefined error
 	ErrUninitialized                   // lexorg: need initialization
 	ErrRewound                         // lexorg: offset precedes retained stream bytes
+	ErrViewTooLarge                    // lexorg: view longer than fill buffer
 )
 
 func (eg errGeneric) Error() string {
